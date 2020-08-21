@@ -46,22 +46,6 @@ class JsonToSqliteLoader:
         cur.execute(query)
         self.dbCnx.commit()
 
-
-    def getChunks(self, chunkSize=100000):
-        with gzip.open(self.path) as f:
-            i = 0
-            accumulator = []
-            for line in f:
-                i += 1
-                accumulator.append(line)
-                if i == chunkSize:
-                    yield accumulator
-                    accumulator = []
-                    i = 0
-            
-            print("The chunk has been done")
-            yield accumulator
-
     def readLines(self):
         with gzip.open(self.path) as f:
             for line in f:
