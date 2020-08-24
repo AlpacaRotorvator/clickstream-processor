@@ -230,6 +230,7 @@ class SessionDbInserter:
                 i += 1
                 if i == trxSize:
                     yield accumulator
+                    accumulator = []
                     i = 0
 
 
