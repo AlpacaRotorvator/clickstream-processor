@@ -3,7 +3,7 @@ import json
 import sqlite3
 from os import path
 
-import pandas as pd
+import numpy as np
 
 class JsonToSqliteLoader:
     def __init__(self, file_path, dbCnx):
@@ -15,7 +15,6 @@ class JsonToSqliteLoader:
 
     def setupTable(self):
         self.createTable()
-        self.createIndex()
 
     def createTable(self):
         # Infelizmente o SQLite não suporta parametrizar o nome da tabela
@@ -92,68 +91,281 @@ def getTables(db):
     for res in cur:
         yield res[0]
 
+
 def getUsersInTable(db, table):
     cur = db.cursor()
-    query = "select distinct anonymous_id from {}".format(table)
+    query = '''select distinct 
+          anonymous_id 
+    from {}'''.format(table)
     cur.execute(query)
     for res in cur:
         yield res
 
-def getEventsByUser(db, table, userId):
+def getSessionKeysInTable(db, table):
+    cur = db.cursor()
+    query = '''select distinct 
+          anonymous_id 
+        , browser_family
+        , os_family
+        , device_family
+        , source_file
+    from {}'''.format(table)
+    cur.execute(query)
+    for res in cur:
+        yield res
+
+def getEventsByUserKey(db, table, userKey):
     query = '''
-        select anonymous_id
-             , browser_family
-             , os_family
-             , device_family
-             , device_sent_timestamp
-             , source_file
+        select browser_family
+            , os_family
+            , device_family
+            , source_file
+            ,device_sent_timestamp
         from {}
         where anonymous_id = ?
     '''.format(table)
 
-    df = pd.read_sql(query, db, params=userId)
+    cur = db.cursor()
+    cur.execute(query, userKey)
 
-    return df
+    for res in cur:
+        yield res
 
-class session:
-    def __init__(self, anonymous_id, browser_family, os_family, device_family, source_file, duration):
-        self.anonymous_id = anonymous_id
-        self.browser_family = browser_family
-        self.os_family = os_family
-        self.device_family = device_family
-        self.source_file = source_file
-        self.duration = duration
+def getEventsBySessionKeys(db, table, sessionKeys):
+    query = '''
+        select device_sent_timestamp
+        from {}
+        where anonymous_id = ?
+            and browser_family = ?
+            and os_family = ?
+            and device_family = ?
+            and source_file = ?
+    '''.format(table)
+
+    cur = db.cursor()
+    cur.execute(query, sessionKeys)
+
+    for res in cur:
+        yield res[0]
+
+
+
+def sessionEvents(events, timeout=30*60*1000):
+    prev = 0
+    duration = 0
+    i = 0
+    sessions = []
+
+    events = np.array([*events])
+    N = events.size
+
+    if N == 1:
+        return [0]
+
+    events.sort()
+    while i < N:
+        prev = events[i]
+        lookahead = prev + timeout
+        new_i = events.searchsorted(lookahead)
+        
+        # There's no other value smaller or equal to lookahead
+        # ie this session is over
+        if  new_i - i == 1 and (new_i >= N or events[new_i] > lookahead):
+            sessions.append(duration)
+            duration = 0
+            i = new_i
+            continue
+        elif new_i - i > 1:
+            new_i -= 1
+
+        i = new_i
+        duration += events[i] - prev
+
+    return sessions
+
+class SessionDbInserter:
+
+    tableName = "SESSIONS"
+
+    def __init__(self, db):
+        self.db = db
+        self.createTable()
+
+    def createTable(self):
+        query = '''
+            CREATE TABLE IF NOT EXISTS {} (
+                  anonymous_id VARCHAR
+                , browser_family VARCHAR
+                , os_family VARCHAR
+                , device_family VARCHAR
+                , source_file VARCHAR
+                , duration INT
+            )
+        '''.format(SessionDbInserter.tableName)
+        cur = self.db.cursor()
+        cur.execute(query)
+        self.db.commit()
+
+    def createIndexes(self):
+        columns = ["browser_family"
+                 , "os_family"
+                 , "device_family"
+                 , "source_file"]
+        query = '''
+            CREATE INDEX IF NOT EXISTS "{col}_idx" ON "{table}" (
+	            "{col}"
+            )
+        '''
+        cur = self.db.cursor()
+        for column in columns:
+            cur.execute(query.format(col=column, table=SessionDbInserter.tableName))
+            self.db.commit()
+    
+    def bulkInsertSessions(self, sessions, trxSize=250000):
+        def getChunk(chunkSize):
+            accumulator = []
+            i = 0
+            for session in sessions:
+                accumulator.append(session)
+                i += 1
+                if i == trxSize:
+                    yield accumulator
+                    i = 0
+
+
+            yield accumulator
+
+        insertQuery = '''
+            INSERT INTO {}
+                (
+                      anonymous_id
+                    , browser_family
+                    , os_family
+                    , device_family
+                    , source_file
+                    , duration
+                )
+            VALUES (?, ?, ?, ?, ?, ?)
+        '''.format(self.tableName)
+
+        cur = self.db.cursor()
+
+        for chunk in getChunk(trxSize): 
+            cur.execute("BEGIN TRANSACTION")
+            for session in chunk:
+                cur.execute(insertQuery, session)
+            cur.execute("COMMIT")
 
     
-def sessionEvents(events):
-    return 0
+def getSessionsFromTable(db, table):
+    sessionKeys = getSessionKeysInTable(db, table)
+    for sessionKey in sessionKeys:
+            events = getEventsBySessionKeys(db, table, sessionKey)
+            sessionDurations = sessionEvents(events)
+            for duration in sessionDurations:
+                yield (*sessionKey, duration)
 
-def insertSessions(db, table, sessions):
-    pass
+class QuestionSolutions:
+    def __init__(self, sessionsDb):
+        self.db = sessionsDb
+        self.__browserFamilies = self.getDistinct("browser_family")
+        self.__osFamilies = self.getDistinct("os_family")
+        self.__deviceFamilies = self.getDistinct("device_family")
+        self.__sourceFiles = self.getDistinct("source_file")
+
+    def getDistinct(self, attrName):
+        query = '''
+            SELECT DISTINCT {}
+            FROM SESSIONS
+        '''
+        res = self.db.execute(query.format(attrName))
+
+        return [x[0] for x in res.fetchall()]
+
+    def getSessionCount(self, sliceField, sliceValues):
+        query = '''
+            SELECT COUNT(*)
+            FROM SESSIONS
+            WHERE {} = ?
+        '''
+        result = {}
+
+        for value in sliceValues:
+            res = self.db.execute(query.format(sliceField), (value,))
+            result[value] = res.fetchone()[0]
+
+        return result
+
+    def getSessionDurations(self, sliceField, sliceValues):
+        query = '''
+            SELECT DURATION
+            FROM SESSIONS
+            WHERE {} = ?
+        '''
+        result = {}
+
+        for value in sliceValues:
+            res = self.db.execute(query.format(sliceField), (value,))
+            result[value] = [x[0] for x in res.fetchall()]
+
+        return result
+
+    def getSessionMedians(self, sliceField, sliceValues):
+        durationsDict = self.getSessionDurations(sliceField, sliceValues)
+
+        for k, v in durationsDict.items():
+            durationsArray = np.array(v).astype(np.int32)
+            durationsDict[k] = np.median(durationsArray)
+
+        return durationsDict
+
+    def questao1(self):
+        sessionCounts = self.getSessionCount("source_file", self.__sourceFiles)
+
+        return sessionCounts
+
+    def questao2(self):
+        returnObj = {}
+
+        returnObj["browser_family"] = self.getSessionCount("browser_family", self.__browserFamilies)
+        returnObj["os_family"] = self.getSessionCount("os_family", self.__osFamilies)
+        returnObj["device_family"] = self.getSessionCount("device_family", self.__deviceFamilies)
+
+        return returnObj
+
+    def questao3(self):
+        returnObj = {}
+
+        returnObj["browser_family"] = self.getSessionMedians("browser_family", self.__browserFamilies)
+        returnObj["os_family"] = self.getSessionMedians("os_family", self.__osFamilies)
+        returnObj["device_family"] = self.getSessionMedians("device_family", self.__deviceFamilies)
+
+        return returnObj
 
 
 def main():
-    db = sqlite3.connect("../db/raw_data.sqlite3")
-    # for i in range(1,10):
-    #     reader = JsonToSqliteLoader(f"/mongodata/part-{i:05}.json.gz", db)
-    #     reader.insertByChunks()
-    for table in getTables(db):
-        userIds = getUsersInTable(db, table)
-        print(f"Found all users in table {table}")
-        i = 0
-        for userId in userIds:
-            print(f"Fetching events for user {userId}")
-            userEvents = getEventsByUser(db, table, userId)
-            sessions = sessionEvents(userEvents)
-            insertSessions(db, table, sessions)
-            print(f"Got'em: {userEvents.shape[0]} records")
-            userEvents.head()
-            if i == 99:
-                break
-            i+=1
+    rawDataDb = sqlite3.connect("./db/raw_data.sqlite3")
+    sessionDb = sqlite3.connect("./db/sessions.sqlite3")
+    sessionInserter = SessionDbInserter(sessionDb)
 
+    for i in range(1,10):
+        dataFile = f"./data/part-{i:05}.json.gz"
+        reader = JsonToSqliteLoader(dataFile, rawDataDb)
+        reader.insertByChunks()
+        reader.createIndex()
+    for table in getTables(rawDataDb):
+        print(f"Processing sessions for table {table}")
+        sessions = getSessionsFromTable(rawDataDb, table)
+        sessionInserter.bulkInsertSessions(sessions)
+    sessionInserter.createIndexes()
 
-    return 0
+    solutions = QuestionSolutions(sessionDb)
+    q1 = solutions.questao1()
+    print(json.dumps(q1, indent=4))
+    q2 = solutions.questao2()
+    print(json.dumps(q2, indent=4))
+    q3 = solutions.questao3()
+    print(json.dumps(q3, indent=4))
            
 
 
