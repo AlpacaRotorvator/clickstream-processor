@@ -42,3 +42,4 @@ Os principais cuidado tomados para manter a performance da aplicação nesse sen
 
 * Uso de uma camada ORM(como SQLAlchemy) para facilitar a manutenção do código e permitir migrar do SQLite para bancos de dados mais robustos de forma transparente.
 * Refatoração das classes para aderir melhor ao princípio da responsabilidade única.
+* Testes automatizados.
